@@ -30,77 +30,192 @@ ebr_system_id:              db 'FAT12   '           ;8 bytes
 
 start:
     jmp main
-    
-;prints a string to the screen
-;params:
+
+
+;
+; Prints a string to the screen
+; Params:
 ;   - ds:si points to string
+;
 puts:
-    ; save registers to be modified
+    ; save registers we will modify
     push si
     push ax
+    push bx
+
 .loop:
-    lodsb       ;loads next character in al
-    or al, al   ;verify: is the next character null?
+    lodsb               ; loads next character in al
+    or al, al           ; verify: is the next character null?
     jz .done
-    mov ah, 0x0e        ; call bios interrupt
-    mov bh, 0
+
+    mov ah, 0x0E        ; call bios interrupt
+    mov bh, 0           ; set page number to 0
     int 0x10
+
     jmp .loop
+
 .done:
+    pop bx
     pop ax
-    pop si
+    pop si    
     ret
+    
 
 main:
-    ; set up data segments
-    mov ax, 0           ; can't write to ds/es directly
+    ; setup data segments
+    mov ax, 0                   ; can't write to ds/es directly
     mov ds, ax
     mov es, ax
-    ; set up stack
+    
+    ; setup stack
     mov ss, ax
-    mov sp, 0x7c00      ; stack grows downwards from where we were loaded in memory 
-    ;prints message
+    mov sp, 0x7C00              ; stack grows downwards from where we were loaded in memory
+
+    ; read something from floppy
+    ; bios should set dl to drive number
+    mov [ebr_drive_number], dl
+
+    mov ax, 1                   ; LBA=1, second sector from disk
+    mov cl, 1                   ; 1 sector to read
+    mov bx, 0x7E00              ; data should be after bootloader
+    call disk_read
+
+    ; print hello world message
     mov si, msg_welcome
     call puts
-    cli
+
+    cli                         ; disable interrupts so cpu can't leave halt state
     hlt
 
+
+;
+; Error handlers
+;
+
+floppy_error:
+    mov si, msg_read_failed
+    call puts
+    jmp wait_key_and_reboot
+
+wait_key_and_reboot:
+    mov ah, 0
+    int 16h                     ; wait for keypress
+    jmp 0FFFFh:0                ; jump to beginning of bios, should reboot
+
 .halt:
-    jmp .halt
+    cli                         ; disable interrupts so cpu can't leave halt state
+    hlt
 
-;Disk Routines
 
-;Converts lba address to chs address
-;parameters:
-;    - ax: an lba address
-; returns
-;   - cx [bits 0 - 5]: sector number
-;   - cx [bits 6 - 15]: cylinder
+;
+; Disk routines
+;
+
+;
+; Converts an LBA address to a CHS address
+; Parameters:
+;   - ax: LBA address
+; Returns:
+;   - cx [bits 0-5]: sector number
+;   - cx [bits 6-15]: cylinder
 ;   - dh: head
+;
+
 lba_to_chs:
+
     push ax
     push dx
 
-    xor dx, dx      ;dx = 0
-    div word [bdb_sectors_per_track]        ;ax = LBA / SectorsPerTrack
-                                            ;dx = LBA % SectorsPerTrack
+    xor dx, dx                          ; dx = 0
+    div word [bdb_sectors_per_track]    ; ax = LBA / SectorsPerTrack
+                                        ; dx = LBA % SectorsPerTrack
 
-    inc dx                                  ;dx = (LBA % SectorsPerTrack + 1) = sector
-    mov cx, dx                              ;cx = sector
+    inc dx                              ; dx = (LBA % SectorsPerTrack + 1) = sector
+    mov cx, dx                          ; cx = sector
 
-    xor = dx, dx                            ;dx = 0
-    div word [bdb_heads]                    ;ax = (LBA / SectorsPerTrack) / Heads = cylinder
-                                            ;dx = (LBA / SectorsPerTrack) % Heads = head
-    mov dh, dl                              ;dh = head
-    mov ch, al                              ; ch = cylinder (lower 8 bits)
+    xor dx, dx                          ; dx = 0
+    div word [bdb_heads]                ; ax = (LBA / SectorsPerTrack) / Heads = cylinder
+                                        ; dx = (LBA / SectorsPerTrack) % Heads = head
+    mov dh, dl                          ; dh = head
+    mov ch, al                          ; ch = cylinder (lower 8 bits)
     shl ah, 6
-    or cl, ah                               ;put upper 2 bits of cyliner in CL
+    or cl, ah                           ; put upper 2 bits of cylinder in CL
 
     pop ax
-    mov dl, al                              ;restore DL
+    mov dl, al                          ; restore DL
     pop ax
     ret
 
+
+;
+; Reads sectors from a disk
+; Parameters:
+;   - ax: LBA address
+;   - cl: number of sectors to read (up to 128)
+;   - dl: drive number
+;   - es:bx: memory address where to store read data
+;
+disk_read:
+
+    push ax                             ; save registers we'll modify
+    push bx
+    push cx
+    push dx
+    push di
+
+    push cx                             ; temporarily save CL (number of sectors to read)
+    call lba_to_chs                     ; compute CHS
+    pop ax                              ; AL = number of sectors to read
+    
+    mov ah, 02h
+    mov di, 3                           ; retry count
+
+.retry:
+    pusha                               ; save all registers, don't know what bios modifies
+    stc                                 ; set carry flag, some bios don't set it
+    int 13h                             ; carry flag cleared = success
+    jnc .done                           ; jump if carry not set
+
+    ; read failed
+    popa
+    call disk_reset
+
+    dec di
+    test di, di
+    jnz .retry
+
+.fail:
+    ; all attempts are exhausted
+    jmp floppy_error
+
+.done:
+    popa
+
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax                             ; restore modified registers
+    ret
+
+
+;
+; Resets disk controller
+; Parameters:
+;   dl: drive number
+;
+disk_reset:
+    pusha
+    mov ah, 0
+    stc
+    int 13h
+    jc floppy_error
+    popa
+    ret
+
+
+
 msg_welcome: db 'Welcome to Soliloquy OS!', ENDL, 0
+msg_read_failed: db 'Read from disk failed!', ENDL, 0
 times 510-($-$$) db 0
 dw 0AA55h
