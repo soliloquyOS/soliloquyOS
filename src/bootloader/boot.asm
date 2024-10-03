@@ -25,43 +25,10 @@ ebr_drive_number:           db 0 ;0x00 floppy, 0x80 hdd, useless
                             db 0 ;reserved
 ebr_signature:              db 29h
 ebr_volume_id:              db 12h, 34h, 56h, 78h   ;serial number, value doesn't matter
-ebr_volume_label:           db 'soliloquyos'
+ebr_volume_label:           db 'soliloquyos'        ;11 bytes, padded w/ spaces
 ebr_system_id:              db 'FAT12   '           ;8 bytes
 
 start:
-    jmp main
-
-
-;
-; Prints a string to the screen
-; Params:
-;   - ds:si points to string
-;
-puts:
-    ; save registers we will modify
-    push si
-    push ax
-    push bx
-
-.loop:
-    lodsb               ; loads next character in al
-    or al, al           ; verify: is the next character null?
-    jz .done
-
-    mov ah, 0x0E        ; call bios interrupt
-    mov bh, 0           ; set page number to 0
-    int 0x10
-
-    jmp .loop
-
-.done:
-    pop bx
-    pop ax
-    pop si    
-    ret
-    
-
-main:
     ; setup data segments
     mov ax, 0                   ; can't write to ds/es directly
     mov ds, ax
@@ -71,18 +38,77 @@ main:
     mov ss, ax
     mov sp, 0x7C00              ; stack grows downwards from where we were loaded in memory
 
+    ;some bios might start at 07C0:0000 instead of 0000:7C00. this fixes that
+    push es
+    push word .after
+    retf
+
+.after:
+
     ; read something from floppy
     ; bios should set dl to drive number
     mov [ebr_drive_number], dl
 
-    mov ax, 1                   ; LBA=1, second sector from disk
-    mov cl, 1                   ; 1 sector to read
-    mov bx, 0x7E00              ; data should be after bootloader
-    call disk_read
-
-    ; print hello world message
+    ;show loading message
     mov si, msg_welcome
     call puts
+
+    ;read drive parameters (sectors per track & head count),
+    ; instead of relying on data on formatted disk
+    push es
+    mov ah, 08h
+    int 13h
+    jc floppy_error
+    pop es
+
+    and cl, 0x3F                ;remove top 2 bits
+    xor ch, ch
+    mov [bdb_sectors_per_track], cx ; sector count
+
+    inc dh
+    mov [bdb_heads], dh             ; head count
+
+    ;compute LBA of root directory = reserved + fats * sectors_per_fat
+    ;note: this section can be hard coded
+    mov ax, [bdb_sectors_per_fat]
+    mov bl, [bdb_fat_count]
+    xor bh, bh
+    mul bx                      ;dx:ax = (fats * sectors_per_fat)
+    add ax, [bdb_reserved_sectors]      ; ax = LBAof root directory
+    push ax
+
+    ;compute size of root directory = (32 * number_of_entries) / bytes_per_sector
+    mov ax, [bdb_sectors_per_fat]
+    shl ax, 5                   ;ax *= 32
+    xor dx, dx                  ;dx = 0
+    div word [bdb_bytes_per_sector]     ;number of sectors we need to read
+
+    test dx, dx
+    jz root_dir_after
+    inc ax      ;division remainder != 0, add 1
+                ; this means we have a sector only partially filled with entries
+
+.root_dir_after:
+    ;read root directory
+    mov cl, al                  ;cl = # of sectors to read = size of root directory
+    pop ax                      ;ax = LBA of root directory
+    mov dl, [ebr_drive_number]  ;dl = drive number
+    mov bx, buffer              ;es:bx = buffer
+    call disk_read
+
+    ;search for kernel.bin
+    xor bx, bx
+    mov di, buffer
+
+.search_kernel:
+    mov si, file_kernel_bin
+    mov cx, 11                  ;compare up to 11 characters
+    push di
+    repe cmpsb
+    pop di
+    je .found_kernel
+
+found_kernel:
 
     cli                         ; disable interrupts so cpu can't leave halt state
     hlt
@@ -215,7 +241,10 @@ disk_reset:
 
 
 
-msg_welcome: db 'Welcome to Soliloquy OS!', ENDL, 0
+msg_loading:     db 'Loading...', ENDL, 0
 msg_read_failed: db 'Read from disk failed!', ENDL, 0
+file_kernel_bin:        db 'KERNEL  BIN'
 times 510-($-$$) db 0
 dw 0AA55h
+
+buffer:
